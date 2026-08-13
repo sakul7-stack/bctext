@@ -12,7 +12,8 @@
 (() => {
   "use strict";
 
-  const R2_RE = /r2\.cloudflarestorage\.com/i;
+  // Only note PDFs are served from R2; require the path to end in ".pdf".
+  const R2_PDF_RE = /r2\.cloudflarestorage\.com\/[^?#]*\.pdf([?#]|$)/i;
   // Note pages look like: /notes/1/cmqi9k8s60031o20nuvyf38g1/viewer
   const NOTE_PATH_RE = /^\/notes\/\d+(\/|$)/;
 
@@ -46,7 +47,7 @@
     const found = [];
     try {
       for (const entry of performance.getEntriesByType("resource")) {
-        if (R2_RE.test(entry.name) && !found.includes(entry.name)) found.push(entry.name);
+        if (R2_PDF_RE.test(entry.name) && !found.includes(entry.name)) found.push(entry.name);
       }
     } catch (e) {
       /* resource timing may be unavailable; ignore */
@@ -55,7 +56,7 @@
       .querySelectorAll("iframe[src], embed[src], object[data], a[href], source[src]")
       .forEach((el) => {
         const raw = el.src || el.data || el.href || "";
-        if (R2_RE.test(raw) && !found.includes(raw)) found.push(raw);
+        if (R2_PDF_RE.test(raw) && !found.includes(raw)) found.push(raw);
       });
     return found;
   }

@@ -11,13 +11,20 @@
 // tabId -> most recent R2 PDF URL observed in that tab
 const pdfByTab = new Map();
 
+// chrome.storage.session is Chromium-only; Firefox falls back to local.
+const lastPdfStore =
+  chrome.storage && chrome.storage.session ? chrome.storage.session : chrome.storage.local;
+
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
+    // Only the note PDFs are served from R2; ignore anything else (e.g. if the
+    // site ever serves images/fonts from there, we must not download those).
+    if (!/\.pdf([?#]|$)/i.test(details.url)) return;
     if (details.tabId >= 0) {
       pdfByTab.set(details.tabId, details.url);
     }
     // Keep the newest one available to the popup as well.
-    chrome.storage.session.set({ lastPdfUrl: details.url }).catch(() => {});
+    lastPdfStore.set({ lastPdfUrl: details.url }).catch(() => {});
   },
   { urls: ["*://*.r2.cloudflarestorage.com/*"] }
 );
@@ -32,7 +39,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 function fileNameFromUrl(url) {
   try {
     const path = new URL(url).pathname;
-    const name = decodeURIComponent(path.split("/").pop() || "");
+    const name = decodeURIComponent(path.split("/").filter(Boolean).pop() || "note.pdf");
     return name.endsWith(".pdf") ? name : name + ".pdf";
   } catch (e) {
     return "note.pdf";
@@ -49,7 +56,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     case "GET_LATEST": {
       // Popup asks: what's the most recent PDF URL we've seen anywhere?
-      chrome.storage.session.get("lastPdfUrl").then((data) => {
+      lastPdfStore.get("lastPdfUrl").then((data) => {
         sendResponse({ url: data.lastPdfUrl || null });
       });
       return true; // async response
