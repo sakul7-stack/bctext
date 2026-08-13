@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "BCT Notes PDF Downloader",
+  "version": "1.0.0",
+  "description": "Adds a Download PDF button to bctnotes.com note pages so you can save notes as PDFs.",
+  "permissions": ["downloads", "storage", "webRequest"],
+  "host_permissions": [
+    "https://bctnotes.com/*",
+    "https://*.r2.cloudflarestorage.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://bctnotes.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "BCT Notes PDF Downloader",
+    "default_popup": "popup.html"
+  }
+}
