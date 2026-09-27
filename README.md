@@ -28,6 +28,21 @@ Open a note on bctnotes.com, wait for it to load, then click the green
 - **Download fails / expired:** reload the note page and click again — the
   download link is only valid for a few minutes.
 
+## Development
+
+Load the unpacked extension for testing.
+
+**Firefox:**
+
+1. Open `about:debugging#/runtime/this-firefox` in Firefox.
+2. Click **Load Temporary Add-on…** and select the `manifest.json` in this
+   folder. (Temporary add-ons unload when Firefox closes.)
+
+**Chrome / Edge:** follow the **Load unpacked** steps under Install above.
+
+After editing any file, reload the extension (the **Reload** button in
+`about:debugging` or `chrome://extensions`) and reload the note tab.
+
 ## How it works
 
 The site serves each PDF from Cloudflare R2 using a short-lived signed URL that

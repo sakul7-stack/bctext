@@ -26,6 +26,21 @@ function isPdfUrl(url) {
   return /\.pdf([?#]|$)/i.test(url);
 }
 
+// In Chrome MV3, custom request headers (like x-bct-client) are "extra
+// headers" and are hidden from onBeforeSendHeaders UNLESS we ask for
+// "extraHeaders". Firefox exposes them with just "requestHeaders" and does not
+// support the "extraHeaders" option, so we only add it on Chromium.
+const headerSpec = ["requestHeaders"];
+try {
+  const OBSH = chrome.webRequest.OnBeforeSendHeadersOptions;
+  if (OBSH && OBSH.EXTRA_HEADERS) {
+    // Present on Chromium only.
+    headerSpec.push("extraHeaders");
+  }
+} catch (e) {
+  /* ignore — Firefox path */
+}
+
 // Watch outgoing request headers so we can grab the signed custom header.
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
@@ -49,9 +64,10 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
       .catch(() => {});
   },
   { urls: ["*://*.r2.cloudflarestorage.com/*"] },
-  // "requestHeaders" gives us the header names/values; custom headers like
-  // x-bct-client are visible. No blocking is used.
-  ["requestHeaders"]
+  // "requestHeaders" gives us header names/values; on Chromium we also need
+  // "extraHeaders" (added above) to see custom headers like x-bct-client.
+  // No blocking is used.
+  headerSpec
 );
 
 // Also keep the plain onBeforeRequest capture as a fallback for the URL in
