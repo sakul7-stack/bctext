@@ -64,8 +64,9 @@
   }
 
   // Core: replay the request WITH the signed x-bct-client header, from the
-  // page's own origin, then save the resulting blob.
-  async function fetchAndSave(info) {
+  // page's own origin, then save the resulting blob. Retries once on a
+  // transient network failure.
+  async function fetchOnce(info) {
     const url = info.url;
     const headers = {};
     if (info.clientHeader) headers["x-bct-client"] = info.clientHeader;
@@ -78,15 +79,56 @@
       headers,
       credentials: "omit",
       mode: "cors",
+      cache: "no-store",
     });
     if (!resp.ok) {
       throw new Error("HTTP " + resp.status + " " + resp.statusText);
     }
-    const blob = await resp.blob();
+    return resp.blob();
+  }
+
+  // Distinguish a bare network failure (no HTTP status) from a real HTTP error.
+  // Firefox surfaces expired/colliding requests as "NetworkError ..." with no
+  // status; those are worth retrying. A real "HTTP 403" is not.
+  function isTransient(err) {
+    const m = (err && err.message) || "";
+    return !/^HTTP \d/.test(m);
+  }
+
+  async function fetchAndSave(info) {
+    let blob = null;
+    let lastErr = null;
+
+    // Firefox can intermittently fail the duplicate cross-origin fetch (race
+    // with the viewer's own request, CORS cache, etc.). Retry a few times with
+    // a short backoff, re-reading the freshest captured URL each round.
+    const delays = [0, 400, 900, 1600];
+    for (let i = 0; i < delays.length && blob === null; i++) {
+      if (delays[i]) await sleep(delays[i]);
+      // Use the freshest capture we have (a note reload would update it).
+      const fresh = await askBackgroundForInfo();
+      const useInfo = fresh && fresh.url ? fresh : info;
+      try {
+        blob = await fetchOnce(useInfo);
+        info = useInfo;
+      } catch (e) {
+        lastErr = e;
+        // A real HTTP error (e.g. 403) won't fix itself by retrying.
+        if (!isTransient(e)) break;
+      }
+    }
+
+    if (blob === null) {
+      if (lastErr && !isTransient(lastErr)) throw lastErr;
+      throw new Error(
+        "network error \u2014 the link may have expired. Reload the note page, then click again."
+      );
+    }
+
     const objectUrl = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = objectUrl;
-    a.download = fileNameFromUrl(url);
+    a.download = fileNameFromUrl(info.url);
     document.body.appendChild(a);
     a.click();
     a.remove();
