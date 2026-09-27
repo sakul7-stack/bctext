@@ -1,24 +1,20 @@
 // content.js — adds a floating "Download PDF" button to bctnotes.com pages.
 //
-// The button only appears on note pages (path like /notes/<id>/...), and it
-// tracks client-side navigation so it shows/hides as you move between pages
-// without a full reload. The notes are served from Cloudflare R2 via
-// short-lived signed URLs, so the button can't use a saved link. When clicked,
-// it asks the background service worker for the live URL captured (via
-// chrome.webRequest) while the note was loading, falling back to scanning
-// resource-timing entries and the DOM for the R2 URL. That URL is then handed
-// to the downloads API.
+// 2026 change: the R2 signed URL now signs a custom "x-bct-client" header
+// (X-Amz-SignedHeaders=host;x-bct-client). So the URL alone is useless — the
+// request must carry that exact header value or R2 returns 403. We can't do
+// that through chrome.downloads, but we CAN do it here: this content script
+// runs in the bctnotes.com page context, so a fetch() we issue has the correct
+// Origin/Referer AND we can attach the captured x-bct-client header. We fetch
+// the bytes, turn them into a Blob, and save via a temporary object URL.
 
 (() => {
   "use strict";
 
-  // Only note PDFs are served from R2; require the path to end in ".pdf".
   const R2_PDF_RE = /r2\.cloudflarestorage\.com\/[^?#]*\.pdf([?#]|$)/i;
-  // Note pages look like: /notes/1/cmqi9k8s60031o20nuvyf38g1/viewer
   const NOTE_PATH_RE = /^\/notes\/\d+(\/|$)/;
 
   const isNotePage = () => NOTE_PATH_RE.test(location.pathname);
-
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   function sendMessage(message) {
@@ -34,15 +30,11 @@
     });
   }
 
-  function askBackgroundForUrl() {
-    return sendMessage({ type: "GET_PDF_URL" }).then((res) => (res && res.url) || null);
+  function askBackgroundForInfo() {
+    return sendMessage({ type: "GET_PDF_INFO" }).then((res) => (res && res.info) || null);
   }
 
-  function downloadPdf(url) {
-    return sendMessage({ type: "DOWNLOAD", url });
-  }
-
-  // Fallback: find R2 URLs the page has already fetched or embedded.
+  // Fallback: find R2 PDF URLs the page has already fetched or embedded.
   function scanPageForPdfUrls() {
     const found = [];
     try {
@@ -50,7 +42,7 @@
         if (R2_PDF_RE.test(entry.name) && !found.includes(entry.name)) found.push(entry.name);
       }
     } catch (e) {
-      /* resource timing may be unavailable; ignore */
+      /* ignore */
     }
     document
       .querySelectorAll("iframe[src], embed[src], object[data], a[href], source[src]")
@@ -61,6 +53,47 @@
     return found;
   }
 
+  function fileNameFromUrl(url) {
+    try {
+      const path = new URL(url).pathname;
+      const name = decodeURIComponent(path.split("/").filter(Boolean).pop() || "note.pdf");
+      return name.endsWith(".pdf") ? name : name + ".pdf";
+    } catch (e) {
+      return "note.pdf";
+    }
+  }
+
+  // Core: replay the request WITH the signed x-bct-client header, from the
+  // page's own origin, then save the resulting blob.
+  async function fetchAndSave(info) {
+    const url = info.url;
+    const headers = {};
+    if (info.clientHeader) headers["x-bct-client"] = info.clientHeader;
+
+    // credentials:"omit" — the signed URL is self-authenticating; sending
+    // cookies is unnecessary and can trip CORS. Origin/Referer are set
+    // automatically because we run in the page context.
+    const resp = await fetch(url, {
+      method: "GET",
+      headers,
+      credentials: "omit",
+      mode: "cors",
+    });
+    if (!resp.ok) {
+      throw new Error("HTTP " + resp.status + " " + resp.statusText);
+    }
+    const blob = await resp.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objectUrl;
+    a.download = fileNameFromUrl(url);
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Revoke a bit later so the download has time to start.
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+  }
+
   function setStatus(statusEl, text, kind) {
     statusEl.textContent = text;
     statusEl.hidden = false;
@@ -69,7 +102,7 @@
     clearTimeout(statusEl._timer);
     statusEl._timer = setTimeout(() => {
       statusEl.hidden = true;
-    }, 4000);
+    }, 6000);
   }
 
   function createUI() {
@@ -109,32 +142,51 @@
     btn.style.opacity = "0.6";
     setStatus(status, "Looking for the PDF link\u2026", "info");
 
-    // Give the note a moment to load; retry until the PDF request is seen.
-    let url = null;
-    for (let attempt = 0; attempt < 12 && !url; attempt++) {
-      url = await askBackgroundForUrl();
-      if (!url) {
-        const scanned = scanPageForPdfUrls();
-        url = scanned.length ? scanned[scanned.length - 1] : null;
+    // Wait for the note to load and for us to have captured the request.
+    let info = null;
+    for (let attempt = 0; attempt < 16 && !info; attempt++) {
+      info = await askBackgroundForInfo();
+      // If background only saw a URL but no header yet, keep waiting a bit —
+      // the header capture (onBeforeSendHeaders) is what we really need.
+      if (info && !info.clientHeader && attempt < 8) {
+        await sleep(400);
+        info = null;
+        continue;
       }
-      if (!url) await sleep(500);
+      if (!info) {
+        const scanned = scanPageForPdfUrls();
+        if (scanned.length) info = { url: scanned[scanned.length - 1], clientHeader: null };
+      }
+      if (!info) await sleep(400);
     }
 
-    if (!url) {
+    if (!info || !info.url) {
       btn.disabled = false;
       btn.style.opacity = "1";
-      setStatus(status, "No PDF link found. Open a note on bctnotes.com, wait for it to load, then try again.", "error");
+      setStatus(
+        status,
+        "No PDF link found. Open a note, wait for it to render, then try again.",
+        "error"
+      );
       return;
     }
 
-    const res = await downloadPdf(url);
-    btn.disabled = false;
-    btn.style.opacity = "1";
-    if (res && res.ok) {
+    setStatus(status, "Downloading\u2026", "info");
+    try {
+      await fetchAndSave(info);
       setStatus(status, "Download started!", "ok");
-    } else {
-      const msg = (res && res.error) || "unknown error";
-      setStatus(status, "Download failed (" + msg + "). The link may have expired \u2014 reload the note page and click again.", "error");
+    } catch (e) {
+      const msg = (e && e.message) || "unknown error";
+      setStatus(
+        status,
+        "Download failed (" +
+          msg +
+          "). The link may have expired \u2014 reload the note page and click again.",
+        "error"
+      );
+    } finally {
+      btn.disabled = false;
+      btn.style.opacity = "1";
     }
   }
 
@@ -160,7 +212,6 @@
     widget.container.style.display = "flex";
   }
 
-  // Re-evaluate on client-side navigation (SPA routing uses pushState).
   function watchNavigations() {
     window.addEventListener("popstate", updateWidget);
     const wrap = (fn) =>
@@ -171,9 +222,24 @@
       };
     history.pushState = wrap(history.pushState);
     history.replaceState = wrap(history.replaceState);
-    // Fallback for routers that navigate some other way.
     setInterval(updateWidget, 1000);
   }
+
+  // Let the popup trigger a download in this (page) context.
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message && message.type === "DOWNLOAD_INFO") {
+      const info = message.info;
+      if (!info || !info.url) {
+        sendResponse({ ok: false, error: "No captured PDF info." });
+        return false;
+      }
+      fetchAndSave(info)
+        .then(() => sendResponse({ ok: true }))
+        .catch((e) => sendResponse({ ok: false, error: (e && e.message) || "fetch failed" }));
+      return true; // async response
+    }
+    return false;
+  });
 
   function main() {
     updateWidget();

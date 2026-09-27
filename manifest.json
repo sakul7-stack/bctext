@@ -3,7 +3,7 @@
   "name": "BCT Notes PDF Downloader",
   "version": "1.0.0",
   "description": "Adds a Download PDF button to bctnotes.com note pages so you can save notes as PDFs.",
-  "permissions": ["downloads", "storage", "webRequest"],
+  "permissions": ["downloads", "storage", "webRequest", "activeTab", "tabs"],
   "host_permissions": [
     "https://bctnotes.com/*",
     "https://*.r2.cloudflarestorage.com/*"

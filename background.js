@@ -1,80 +1,88 @@
 // background.js — service worker for BCT Notes PDF Downloader.
 //
 // The bctnotes.com viewer loads each note's PDF from Cloudflare R2 via a
-// short-lived signed URL (the X-Amz-Expires=900 query param means it dies
-// after ~15 minutes). That URL is generated fresh on every page load, so we
-// can't reuse a saved link. Instead we watch the actual network requests with
-// chrome.webRequest (passive observation, no blocking) and remember the most
-// recent PDF URL per tab. The content-script button and the popup then ask us
-// to download that URL before its signature expires.
+// short-lived signed URL (X-Amz-Expires means the signature dies after a few
+// minutes). A fresh URL is generated on every page load, so we can't reuse a
+// saved link.
+//
+// IMPORTANT (2026 change): the site now signs a custom request header,
+// "x-bct-client", into the URL signature:
+//     X-Amz-SignedHeaders=host;x-bct-client
+// That means the request will ONLY be accepted by R2 if it is sent WITH that
+// exact header value. A plain browser navigation or chrome.downloads request
+// does not send it, so the download is rejected (that's why the old extension
+// broke). We therefore capture BOTH the URL *and* the x-bct-client header the
+// site sends, and later replay the fetch from the page context with that
+// header so the signature validates.
 
-// tabId -> most recent R2 PDF URL observed in that tab
+// tabId -> { url, clientHeader } most recently observed in that tab.
 const pdfByTab = new Map();
 
 // chrome.storage.session is Chromium-only; Firefox falls back to local.
 const lastPdfStore =
   chrome.storage && chrome.storage.session ? chrome.storage.session : chrome.storage.local;
 
+function isPdfUrl(url) {
+  return /\.pdf([?#]|$)/i.test(url);
+}
+
+// Watch outgoing request headers so we can grab the signed custom header.
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  (details) => {
+    if (!isPdfUrl(details.url)) return;
+    let clientHeader = null;
+    for (const h of details.requestHeaders || []) {
+      if (h.name.toLowerCase() === "x-bct-client") {
+        clientHeader = h.value;
+        break;
+      }
+    }
+    if (details.tabId >= 0) {
+      const prev = pdfByTab.get(details.tabId) || {};
+      pdfByTab.set(details.tabId, {
+        url: details.url,
+        clientHeader: clientHeader != null ? clientHeader : prev.clientHeader || null,
+      });
+    }
+    lastPdfStore
+      .set({ lastPdf: { url: details.url, clientHeader: clientHeader || null } })
+      .catch(() => {});
+  },
+  { urls: ["*://*.r2.cloudflarestorage.com/*"] },
+  // "requestHeaders" gives us the header names/values; custom headers like
+  // x-bct-client are visible. No blocking is used.
+  ["requestHeaders"]
+);
+
+// Also keep the plain onBeforeRequest capture as a fallback for the URL in
+// case a request has no custom header (older/other flows).
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
-    // Only the note PDFs are served from R2; ignore anything else (e.g. if the
-    // site ever serves images/fonts from there, we must not download those).
-    if (!/\.pdf([?#]|$)/i.test(details.url)) return;
-    if (details.tabId >= 0) {
-      pdfByTab.set(details.tabId, details.url);
+    if (!isPdfUrl(details.url)) return;
+    if (details.tabId >= 0 && !pdfByTab.has(details.tabId)) {
+      pdfByTab.set(details.tabId, { url: details.url, clientHeader: null });
     }
-    // Keep the newest one available to the popup as well.
-    lastPdfStore.set({ lastPdfUrl: details.url }).catch(() => {});
   },
   { urls: ["*://*.r2.cloudflarestorage.com/*"] }
 );
 
-// Tidy up when a tab closes so the map doesn't grow forever.
 chrome.tabs.onRemoved.addListener((tabId) => {
   pdfByTab.delete(tabId);
 });
 
-// Turn ".../v3/first/CT%20101/Programming_in_C.pdf?X-Amz-..." into
-// "Programming_in_C.pdf" so the saved file has a sensible name.
-function fileNameFromUrl(url) {
-  try {
-    const path = new URL(url).pathname;
-    const name = decodeURIComponent(path.split("/").filter(Boolean).pop() || "note.pdf");
-    return name.endsWith(".pdf") ? name : name + ".pdf";
-  } catch (e) {
-    return "note.pdf";
-  }
-}
-
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   switch (message && message.type) {
-    case "GET_PDF_URL": {
-      // Content script asks: what PDF URL did we capture for this tab?
-      const url = sender.tab && pdfByTab.get(sender.tab.id);
-      sendResponse({ url: url || null });
+    case "GET_PDF_INFO": {
+      // Content script asks: what PDF URL + header did we capture for this tab?
+      const info = (sender.tab && pdfByTab.get(sender.tab.id)) || null;
+      sendResponse({ info });
       return false;
     }
     case "GET_LATEST": {
-      // Popup asks: what's the most recent PDF URL we've seen anywhere?
-      lastPdfStore.get("lastPdfUrl").then((data) => {
-        sendResponse({ url: data.lastPdfUrl || null });
+      // Popup asks: what's the most recent PDF we've seen anywhere?
+      lastPdfStore.get("lastPdf").then((data) => {
+        sendResponse({ info: data.lastPdf || null });
       });
-      return true; // async response
-    }
-    case "DOWNLOAD": {
-      const url = message.url || (sender.tab && pdfByTab.get(sender.tab.id));
-      if (!url) {
-        sendResponse({ ok: false, error: "No PDF URL captured yet. Open a note on bctnotes.com first." });
-        return false;
-      }
-      chrome.downloads.download(
-        { url, filename: fileNameFromUrl(url), saveAs: false },
-        (downloadId) => {
-          const err = chrome.runtime.lastError;
-          if (err) sendResponse({ ok: false, error: err.message });
-          else sendResponse({ ok: true, downloadId });
-        }
-      );
       return true; // async response
     }
     default:
