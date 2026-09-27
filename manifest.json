@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "BCT Notes PDF Downloader",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Adds a Download PDF button to bctnotes.com note pages so you can save notes as PDFs.",
   "permissions": ["downloads", "storage", "webRequest", "activeTab", "tabs"],
   "host_permissions": [
